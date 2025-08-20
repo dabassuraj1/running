@@ -34,7 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8400752699:AAH_dgoJARayhGGOy0jGEEd_YURkzehy0
 OWNER_ID = 8120431402
 DATA_FILE = "users.json"
 
-API_ENDPOINT = "https://rtdb-2.onrender.com/vehicle?rc="
+API_ENDPOINT = "https://vahanx.in/rc-search/HP10B0031"
 
 # Payments & Credits
 CREDITS_PER_SEARCH = 10       # 1 search costs 10 credits
