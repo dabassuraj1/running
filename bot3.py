@@ -1,680 +1,783 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Vehicle Info Telegram Bot
-- Credit system (SQLite)
-- Fancy report output (box + emoji) — EXACT TEMPLATE
-- User menu + Admin panel (inline buttons)
-- Admin guided flows (add/remove credits, set price, broadcast)
-- Logs + simple analytics
+Vehicle OSINT Bot (Pydroid-friendly)
+- Old UI with bottom reply keyboard
+- API: https://api-vehicle-osint.vercel.app/?rc=
+- Credits: ₹10 = 10 credits; 1 search = 10 credits
+- Payment flow with confirmations (Amount -> Screenshot -> UTR)
+- Admin approval queue
+- Code generation and redemption system
 """
 
 import os
-import re
-import csv
+import json
 import time
-import uuid
-import sqlite3
+import random
+import string
 import logging
 import requests
-from datetime import datetime
+from typing import Dict, Any, Optional
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    filters, ContextTypes
-)
+# Import telegram bot components with error handling
+try:
+    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+    # Import telegram classes needed for keyboards
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+except ImportError as e:
+    print(f"❌ ImportError: {e}")
+    print("Please install python-telegram-bot library")
+    print("Run: pip install python-telegram-bot")
+    exit(1)
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7596706471:AAHaVeFYHy7hlNamSf-u1_ZYkLXVbLrH4FU")
-ADMINS = {7922285746}  # <-- put your numeric Telegram user IDs here
-DB_FILE = os.getenv("DB_FILE", "vehicle_bot.db")
-API_URL = "https://rtdb-2.onrender.com/vehicle?rc="
-DEFAULT_CREDIT_COST = 1
-INITIAL_USER_CREDITS = 0  # new users start with 0 (change if you want freebies)
+# ================== CONFIG ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8400752699:AAH_dgoJARayhGGOy0jGEEd_YURkzehy0q0")
+OWNER_ID = 8120431402
+DATA_FILE = "users.json"
 
-# ---------------- LOGGING ----------------
+API_ENDPOINT = "https://rtdb-2.onrender.com/vehicle?rc="
+
+# Payments & Credits
+CREDITS_PER_SEARCH = 10       # 1 search costs 10 credits
+UPI_ID = "http://t.me/OSINTSUPPORTsBOT"
+QR_IMAGE_URL = "https://t.me/Vechialosint"   # not a direct image; we show as text link
+BUY_PRICE_TEXT = f"💳 Price: 10₹ = 10 credits\n({CREDITS_PER_SEARCH} credits = 1 search)"
+
+# ================== LOGGING ==================
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("vehicle-bot")
 
-# ---------------- DB LAYER ----------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ================== STORAGE ==================
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}, [], {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and "users" in data:
+                return data.get("users", {}), data.get("payments", []), data.get("codes", {})
+            elif isinstance(data, dict):
+                return data, [], {}
+            else:
+                return {}, [], {}
+    except Exception as e:
+        log.exception("load_data failed")
+        return {}, [], {}
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        first_name TEXT,
-        username TEXT,
-        credits INTEGER DEFAULT 0,
-        banned INTEGER DEFAULT 0,
-        created_at TEXT,
-        updated_at TEXT
+def save_data():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({"users": users, "payments": payments, "codes": codes}, f, indent=2, ensure_ascii=False)
+    except Exception:
+        log.exception("save_data failed")
+
+users, payments, codes = load_data()
+
+def get_user(uid: int) -> Dict[str, Any]:
+    suid = str(uid)
+    if suid not in users:
+        users[suid] = {"credits": 0, "blocked": False, "searches": 0}
+        save_data()
+    return users[suid]
+
+def new_payment_id() -> str:
+    return f"P{int(time.time())}{random.randint(100,999)}"
+
+def generate_code() -> str:
+    """Generate a code in XXX-XXX-XXX format"""
+    chars = string.ascii_uppercase + string.digits
+    part1 = ''.join(random.choices(chars, k=3))
+    part2 = ''.join(random.choices(chars, k=3))
+    part3 = ''.join(random.choices(chars, k=3))
+    return f"{part1}-{part2}-{part3}"
+
+# ================== KEYBOARDS ==================
+def kb_main(uid: int):
+    rows = [
+        [KeyboardButton("🔍 Vehicle Lookup"), KeyboardButton("💳 Buy Credits")],
+        [KeyboardButton("📊 My Balance"), KeyboardButton("👤 Profile")],
+        [KeyboardButton("ℹ️ Help")]
+    ]
+    if uid == OWNER_ID:
+        rows.append([KeyboardButton("⚙️ Admin Panel")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def kb_back():
+    return ReplyKeyboardMarkup([[KeyboardButton("⬅️ Back to Menu")]], resize_keyboard=True)
+
+def kb_buy_main():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("✅ Payment Done")],[KeyboardButton("⬅️ Back to Menu")]],
+        resize_keyboard=True
     )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
+
+def kb_amount_confirm():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("✅ Confirm Amount")],
+            [KeyboardButton("✏️ Change Amount")],
+            [KeyboardButton("⬅️ Back to Menu")],
+        ], resize_keyboard=True
     )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS logs (
-        id TEXT PRIMARY KEY,
-        user_id INTEGER,
-        rc TEXT,
-        ok INTEGER,
-        cost INTEGER,
-        created_at TEXT
+
+def kb_ss_confirm():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("✅ Confirm Screenshot")],
+            [KeyboardButton("📤 Re-upload Screenshot")],
+            [KeyboardButton("⬅️ Back to Menu")],
+        ], resize_keyboard=True
     )
-    """)
-    cur.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('credit_cost', ?)", (str(DEFAULT_CREDIT_COST),))
-    conn.commit()
-    conn.close()
 
-def now_iso():
-    return datetime.utcnow().isoformat()
+def kb_utr_confirm():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("✅ Confirm UTR")],
+            [KeyboardButton("✏️ Change UTR")],
+            [KeyboardButton("⬅️ Back to Menu")],
+        ], resize_keyboard=True
+    )
 
-def get_setting(key, default=None):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row["value"] if row else default
+def kb_admin():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📬 Pending Payments"), KeyboardButton("📈 Stats")],
+            [KeyboardButton("🎫 Generate Codes"), KeyboardButton("📋 View Codes")],
+            [KeyboardButton("⬅️ Back to Menu")]
+        ], resize_keyboard=True
+    )
 
-def set_setting(key, value):
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
-    conn.commit(); conn.close()
+# ================== HELPERS ==================
+def sanitize(val, default="NA"):
+    if val in [None, "", "null", "Null", "NULL"]:
+        return default
+    return str(val)
 
-def upsert_user(user):
-    conn = db(); cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO users(user_id, first_name, username, credits, banned, created_at, updated_at)
-    VALUES(?,?,?,?,0,?,?)
-    ON CONFLICT(user_id) DO UPDATE SET
-        first_name=excluded.first_name,
-        username=excluded.username,
-        updated_at=excluded.updated_at
-    """, (
-        user.id,
-        user.first_name or "",
-        user.username or "",
-        INITIAL_USER_CREDITS,
-        now_iso(),
-        now_iso(),
-    ))
-    conn.commit(); conn.close()
-
-def get_user(user_id):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-def add_credits(user_id, amount):
-    conn = db(); cur = conn.cursor()
-    cur.execute("UPDATE users SET credits = COALESCE(credits,0) + ?, updated_at=? WHERE user_id=?",
-                (amount, now_iso(), user_id))
-    conn.commit(); conn.close()
-
-def change_ban(user_id, banned: bool):
-    conn = db(); cur = conn.cursor()
-    cur.execute("UPDATE users SET banned=?, updated_at=? WHERE user_id=?",
-                (1 if banned else 0, now_iso(), user_id))
-    conn.commit(); conn.close()
-
-def list_users(limit=50, offset=0):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM users ORDER BY created_at ASC LIMIT ? OFFSET ?", (limit, offset))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def count_users():
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM users")
-    c = cur.fetchone()["c"]
-    conn.close()
-    return c
-
-def log_lookup(user_id, rc, ok, cost):
-    conn = db(); cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO logs(id, user_id, rc, ok, cost, created_at)
-    VALUES(?,?,?,?,?,?)
-    """, (str(uuid.uuid4()), user_id, rc, 1 if ok else 0, cost, now_iso()))
-    conn.commit(); conn.close()
-
-def stats_summary():
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM users"); users = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM logs"); lookups = cur.fetchone()["c"]
-    cur.execute("SELECT SUM(cost) AS s FROM logs"); spent = cur.fetchone()["s"]
-    conn.close()
-    return {"users": users or 0, "lookups": lookups or 0, "credits_spent": spent or 0}
-
-# ---------------- HELPERS ----------------
-def format_date_safe(s: str):
-    """Return parsed date dd-Mon-YYYY if possible, else original."""
-    if not s or s in ("None", "N/A"):
-        return "N/A"
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.strftime("%d-%b-%Y")
-        except Exception:
-            pass
-    return s
-
-def sanitize(val):
-    if val is None:
-        return "N/A"
-    s = str(val).strip()
-    if s == "" or s.lower() == "none":
-        return "N/A"
-    return s
-
-def format_vehicle_report(data: dict) -> str:
-    """
-    EXACTLY the layout you requested.
-    Hides: ok, note, error
-    """
-    # Remove fields we must NOT show
-    for k in ("ok", "note", "error"):
-        data.pop(k, None)
-
-    rc = sanitize(data.get("rc"))
+def render_vehicle_card(rc: str, data: Dict[str, Any]) -> str:
     owner_name = sanitize(data.get("owner_name"))
     father_name = sanitize(data.get("father_name"))
-    owner_serial_no = sanitize(data.get("owner_serial_no"))
-    model_name = sanitize(data.get("model_name"))
-    maker_model = sanitize(data.get("maker_model"))
-    vehicle_class = sanitize(data.get("vehicle_class"))
-    fuel_type = sanitize(data.get("fuel_type"))
-    fuel_norms = sanitize(data.get("fuel_norms"))
-    reg_date = format_date_safe(sanitize(data.get("reg_date")))
-    insurance_company = sanitize(data.get("insurance_company"))
-    insurance_no = sanitize(data.get("insurance_no"))
-    insurance_expiry = format_date_safe(sanitize(data.get("insurance_expiry")))
-    insurance_upto = format_date_safe(sanitize(data.get("insurance_upto")))
-    fitness_upto = format_date_safe(sanitize(data.get("fitness_upto")))
-    tax_upto = sanitize(data.get("tax_upto"))
-    puc_no = sanitize(data.get("puc_no"))  # not shown in this exact layout
-    puc_upto = format_date_safe(sanitize(data.get("puc_upto")))  # not shown in this exact layout
-    financier_name = sanitize(data.get("financier_name"))  # not shown here
-    rto = sanitize(data.get("rto"))
     address = sanitize(data.get("address"))
-    city = sanitize(data.get("city"))
     phone = sanitize(data.get("phone"))
+    rto = sanitize(data.get("rto"))
 
-    lines = []
-    lines.append("╔════════════════════════════════════════╗")
-    lines.append("║       🚗  🎯 Vehicle Detailed Report  🛠️")
-    lines.append("╚════════════════════════════════════════╗")
-    lines.append("")
-    lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃    📋 PRIMARY INFORMATION    ┃")
-    lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    lines.append(f"👤 Owner Name: {owner_name}")
-    lines.append(f"👨‍👦 Father's Name: {father_name}")
-    lines.append(f"🏠 Address: {address}")
-    lines.append(f"🌆 City: {city}")
-    lines.append(f"📞 Phone: {phone}")
-    lines.append(f"📇 Owner Serial No: {owner_serial_no}")
-    lines.append(f"🏷️ Vehicle Class: {vehicle_class}")
-    lines.append("")
-    lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃    🚙 VEHICLE DETAILS    ┃")
-    lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    lines.append(f"📄 Registration No: {rc}")
-    lines.append(f"📅 Registration Date: {reg_date}")
-    lines.append(f"🏢 RTO Office: {rto}")
-    lines.append(f"⚙️ Maker Model: {maker_model}")
-    lines.append(f"🏷 Model Name: {model_name}")
-    lines.append(f"⛽ Fuel Type: {fuel_type}")
-    lines.append(f"🛢 Fuel Norms: {fuel_norms}")
-    lines.append(f"🔧 Fitness Valid Upto: {fitness_upto}")
-    lines.append(f"💸 Tax Valid Upto: {tax_upto}")
-    lines.append("")
-    lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃    🛡️ INSURANCE DETAILS    ┃")
-    lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    lines.append(f"🏢 Insurance Company: {insurance_company}")
-    lines.append(f"📜 Policy No: {insurance_no}")
-    lines.append(f"📆 Insurance Expiry: {insurance_expiry}")
-    lines.append(f"📅 Insurance Valid Upto: {insurance_upto}")
-    lines.append("")
-    lines.append("┏━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    lines.append("┃    🛠️ ADDITIONAL DETAILS    ┃")
-    lines.append("┗━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    lines.append("")  # keep empty as per your sample
-    lines.append("╚════════════════════════════════════════╝")
-    body = "\n".join(lines)
-    # Wrap in code block for perfect alignment in Telegram
-    return f"```\n{body}\n```"
+    model = sanitize(data.get("model_name"))
+    variant = sanitize(data.get("maker_model"))
+    vclass = sanitize(data.get("vehicle_class"))
+    fuel = sanitize(data.get("fuel_type"))
+    reg_date = sanitize(data.get("registration_date"))
 
-def user_menu_kb(is_admin: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("🚘 Get Vehicle Info", callback_data="u:get")],
-        [InlineKeyboardButton("💳 Check Credits", callback_data="u:credits"),
-         InlineKeyboardButton("➕ Buy Credits", callback_data="u:buy")],
-        [InlineKeyboardButton("💰 Price", callback_data="u:price"),
-         InlineKeyboardButton("ℹ️ Help", callback_data="u:help")]
-    ]
-    if is_admin:
-        rows.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="a:panel")])
-    return InlineKeyboardMarkup(rows)
+    ins_co = sanitize(data.get("insurance_company", "None"), "None")
+    ins_no = sanitize(data.get("insurance_no"))
+    ins_valid = sanitize(data.get("insurance_upto") or data.get("insurance_expiry"), "None")
 
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Users", callback_data="a:users"),
-         InlineKeyboardButton("📊 Stats", callback_data="a:stats")],
-        [InlineKeyboardButton("➕ Add Credits", callback_data="a:add"),
-         InlineKeyboardButton("➖ Remove Credits", callback_data="a:sub")],
-        [InlineKeyboardButton("💳 Check Credits", callback_data="a:check"),
-         InlineKeyboardButton("⚙️ Set Price", callback_data="a:setprice")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="a:broadcast"),
-         InlineKeyboardButton("🚫 Ban/Unban", callback_data="a:ban")],
-        [InlineKeyboardButton("📤 Export Users CSV", callback_data="a:export")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="a:back")]
-    ])
+    fitness = sanitize(data.get("fitness_upto"))
+    tax = sanitize(data.get("tax_upto"))
+    puc = sanitize(data.get("puc_upto"))
 
-# ---------------- BOT HANDLERS ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    upsert_user(user)
-    is_admin = user.id in ADMINS
-    urow = get_user(user.id)
-    credits = urow["credits"] if urow else 0
-    await update.message.reply_text(
-        f"👋 Hello {user.first_name}!\n"
-        f"Welcome to the Vehicle Info Bot.\n\n"
-        f"🔑 Credits: {credits}\n"
-        f"Use the menu below.",
-        reply_markup=user_menu_kb(is_admin)
-    )
+    if ins_co == "NA": ins_co = "None"
+    if ins_valid == "NA": ins_valid = "None"
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_admin = update.effective_user.id in ADMINS
-    if is_admin:
-        text = (
-            "📖 *Help – Admin*\n\n"
-            "User commands:\n"
-            "• /start – open menu\n"
-            "• /vehicle <RC> – fetch details\n"
-            "• /credits – show credits\n"
-            "• /help – this help\n\n"
-            "Admin commands:\n"
-            "• /admin – open admin panel\n"
-            "• /setprice <amount> – set lookup price\n"
-            "• /addcredits <user_id> <amount>\n"
-            "• /removecredits <user_id> <amount>\n"
-            "• /checkcredits <user_id>\n"
-            "• /broadcast <message>\n"
-            "• /ban <user_id>  /unban <user_id>\n"
-            "• /users – first 50 users\n"
-            "• /stats – summary\n"
-        )
-    else:
-        text = (
-            "📖 *Help – User*\n\n"
-            "• /start – open menu\n"
-            "• /vehicle <RC> – get vehicle details (uses credits)\n"
-            "• /credits – check your credits\n"
-            "• /help – this help\n"
-            "Need more credits? Tap *Buy Credits*."
-        )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    return f"""🚗 Vehicle Details for {rc}
 
-async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user(update.effective_user)
-    urow = get_user(update.effective_user.id)
-    await update.message.reply_text(f"💳 Your credits: {urow['credits']}")
+👤 Owner Information
+• Name: {owner_name}
+• Father's Name: {father_name}
+• Address: {address}
+• Phone: {phone}
+• RTO: {rto}
 
-async def vehicle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    upsert_user(user)
-    urow = get_user(user.id)
-    if urow["banned"]:
-        await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
+🚘 Vehicle Details
+• Model: {model}
+• Variant: {variant}
+• Class: {vclass}
+• Fuel: {fuel}
+• Reg Date: {reg_date}
 
-    if not context.args:
-        await update.message.reply_text("Usage: /vehicle <RC_NUMBER>")
-        return
-    rc = re.sub(r"[^A-Z0-9]", "", context.args[0].upper())
+📄 Insurance Details
+• Company: {ins_co}
+• Policy No: {ins_no}
+• Valid Until: {ins_valid}
 
-    # price
-    cost = int(get_setting("credit_cost", DEFAULT_CREDIT_COST))
-    if urow["credits"] < cost:
-        await update.message.reply_text(
-            f"⚠️ Not enough credits. Price per lookup: {cost}. Tap *Buy Credits*.",
-            parse_mode="Markdown",
-            reply_markup=user_menu_kb(user.id in ADMINS)
-        )
-        return
+📑 Other Documents
+• Fitness Valid Until: {fitness}
+• Tax Paid Until: {tax}
+• PUC Valid Until: {puc}
 
-    # call API
+👑 RA BROs"""
+
+def fetch_vehicle(rc: str) -> Dict[str, Any]:
     try:
-        res = requests.get(API_URL + rc, timeout=15)
-        data = res.json()
+        url = f"{API_ENDPOINT}{rc}"
+        log.info(f"Fetching vehicle data from: {url}")
+        r = requests.get(url, timeout=20)
+        log.info(f"API Response status: {r.status_code}")
+        
+        if r.status_code != 200:
+            raise RuntimeError(f"API HTTP {r.status_code}")
+        
+        data = r.json()
+        log.info(f"API Response data type: {type(data)}")
+        log.info(f"API Response data: {str(data)[:200]}...")
+        
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict):
+            raise RuntimeError("Unexpected API response format")
+        
+        # Check if the response contains error or empty data
+        if not data or data.get("error") or not data.get("owner_name"):
+            raise RuntimeError("No vehicle data found or invalid registration number")
+            
+        return data
+    except requests.exceptions.RequestException as e:
+        log.error(f"Network error while fetching vehicle data: {e}")
+        raise RuntimeError(f"Network error: {str(e)}")
+    except json.JSONDecodeError as e:
+        log.error(f"JSON decode error: {e}")
+        raise RuntimeError("Invalid response format from API")
     except Exception as e:
-        await update.message.reply_text(f"❌ API error: {e}")
+        log.error(f"Unexpected error in fetch_vehicle: {e}")
+        raise RuntimeError(f"Unexpected error: {str(e)}")
+
+# ================== COMMANDS ==================
+async def cmd_start(update, ctx):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    if u["blocked"]:
+        await update.message.reply_text("🚫 You are blocked from using this bot.")
         return
+    ctx.user_data.clear()
+    await update.message.reply_text("👋 Welcome to OSINT Vehicle Bot!", reply_markup=kb_main(uid))
 
-    ok = bool(data.get("ok"))
-    if ok:
-        add_credits(user.id, -cost)
-    log_lookup(user.id, rc, ok, cost if ok else 0)
-
-    if ok:
-        text = format_vehicle_report(dict(data))
-        # Send with Markdown so the ``` block is monospaced
-        await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
-        newu = get_user(user.id)
-        await update.message.reply_text(f"✅ Lookup done. Remaining credits: {newu['credits']}")
-    else:
-        await update.message.reply_text(f"❌ No data found for *{rc}*.", parse_mode="Markdown")
-
-# -------- Inline Button Router --------
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    user = query.from_user
-    upsert_user(user)
-
-    # USER actions
-    if data == "u:get":
-        await query.edit_message_text(
-            "✍️ Send RC using command:\n`/vehicle MH17CR7001`",
-            parse_mode="Markdown",
-            reply_markup=user_menu_kb(user.id in ADMINS)
-        ); return
-    if data == "u:credits":
-        urow = get_user(user.id)
-        await query.edit_message_text(
-            f"💳 Your credits: {urow['credits']}",
-            reply_markup=user_menu_kb(user.id in ADMINS)
-        ); return
-    if data == "u:buy":
-        price = int(get_setting("credit_cost", DEFAULT_CREDIT_COST))
-        await query.edit_message_text(
-            f"🛒 *Buy Credits*\n\n"
-            f"Current price per lookup: *{price}*\n"
-            f"• 10 credits – ₹???\n"
-            f"• 50 credits – ₹???\n"
-            f"• 100 credits – ₹???\n\n"
-            f"Contact admin to purchase.",
-            parse_mode="Markdown",
-            reply_markup=user_menu_kb(user.id in ADMINS)
-        ); return
-    if data == "u:price":
-        price = int(get_setting("credit_cost", DEFAULT_CREDIT_COST))
-        await query.edit_message_text(
-            f"💰 Current price per lookup: *{price}* credits.",
-            parse_mode="Markdown",
-            reply_markup=user_menu_kb(user.id in ADMINS)
-        ); return
-    if data == "u:help":
-        await help_cmd(update, context); return
-
-    # ADMIN actions
-    if data == "a:panel":
-        if user.id not in ADMINS: return
-        await query.edit_message_text("⚙️ Admin Panel", reply_markup=admin_panel_kb()); return
-
-    if data == "a:back":
-        await query.edit_message_text("Back to menu.", reply_markup=user_menu_kb(user.id in ADMINS)); return
-
-    if user.id not in ADMINS:
-        return
-
-    if data == "a:stats":
-        s = stats_summary()
-        price = get_setting("credit_cost", DEFAULT_CREDIT_COST)
-        await query.edit_message_text(
-            f"📊 *Stats*\nUsers: {s['users']}\nLookups: {s['lookups']}\nCredits spent: {s['credits_spent']}\nPrice: {price}",
-            parse_mode="Markdown",
-            reply_markup=admin_panel_kb()
-        ); return
-
-    if data == "a:users":
-        rows = list_users(limit=20, offset=0)
-        if not rows:
-            txt = "No users."
-        else:
-            lines = ["👥 *Users (first 20)*"]
-            for r in rows:
-                lines.append(f"{r['user_id']} | {r['first_name']} | @{r['username'] or '-'} | {r['credits']} cr | {'BANNED' if r['banned'] else 'OK'}")
-            txt = "\n".join(lines)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-
-    if data == "a:add":
-        context.user_data["admin_mode"] = "add"
-        await query.edit_message_text("➕ Send: `user_id amount` (e.g. `123456789 10`)", parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-
-    if data == "a:sub":
-        context.user_data["admin_mode"] = "sub"
-        await query.edit_message_text("➖ Send: `user_id amount`", parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-
-    if data == "a:check":
-        context.user_data["admin_mode"] = "check"
-        await query.edit_message_text("💳 Send: `user_id`", parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-
-    if data == "a:setprice":
-        context.user_data["admin_mode"] = "price"
-        await query.edit_message_text("⚙️ Send new price (integer):", reply_markup=admin_panel_kb()); return
-
-    if data == "a:broadcast":
-        context.user_data["admin_mode"] = "broadcast"
-        await query.edit_message_text("📢 Send broadcast message text:", reply_markup=admin_panel_kb()); return
-
-    if data == "a:ban":
-        context.user_data["admin_mode"] = "ban"
-        await query.edit_message_text("🚫 Send: `ban user_id` or `unban user_id`", parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-
-    if data == "a:export":
-        path = f"/tmp/users_{int(time.time())}.csv"
-        rows = list_users(limit=100000, offset=0)
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["user_id", "first_name", "username", "credits", "banned", "created_at", "updated_at"])
-            for r in rows:
-                w.writerow([r["user_id"], r["first_name"], r["username"], r["credits"], r["banned"], r["created_at"], r["updated_at"]])
-        await query.message.reply_document(InputFile(path), caption="📤 Exported users CSV")
-        await query.edit_message_text("Export complete.", reply_markup=admin_panel_kb()); return
-
-# Admin free-text for guided actions
-async def admin_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in ADMINS:
-        return
-    mode = context.user_data.get("admin_mode")
-    if not mode:
-        return
-    txt = (update.message.text or "").strip()
-    try:
-        if mode == "add":
-            uid_s, amt_s = txt.split()
-            add_credits(int(uid_s), int(amt_s))
-            await update.message.reply_text(f"✅ Added {int(amt_s)} credits to {int(uid_s)}.", reply_markup=admin_panel_kb())
-        elif mode == "sub":
-            uid_s, amt_s = txt.split()
-            add_credits(int(uid_s), -abs(int(amt_s)))
-            await update.message.reply_text(f"✅ Removed {int(amt_s)} credits from {int(uid_s)}.", reply_markup=admin_panel_kb())
-        elif mode == "check":
-            uid = int(txt)
-            u = get_user(uid)
-            if not u:
-                await update.message.reply_text("User not found.", reply_markup=admin_panel_kb()); return
-            await update.message.reply_text(f"User {uid} → {u['credits']} credits. {'BANNED' if u['banned'] else 'OK'}", reply_markup=admin_panel_kb())
-        elif mode == "price":
-            price = int(txt)
-            set_setting("credit_cost", price)
-            await update.message.reply_text(f"✅ Price set to {price} credits per lookup.", reply_markup=admin_panel_kb())
-        elif mode == "broadcast":
-            msg = txt
-            total = 0
-            for offset in range(0, count_users(), 100):
-                rows = list_users(limit=100, offset=offset)
-                for r in rows:
-                    try:
-                        await context.bot.send_message(r["user_id"], f"📢 {msg}")
-                        total += 1
-                    except Exception:
-                        pass
-            await update.message.reply_text(f"✅ Broadcast delivered to ~{total} users.", reply_markup=admin_panel_kb())
-        elif mode == "ban":
-            parts = txt.split()
-            if len(parts) != 2 or parts[0] not in {"ban", "unban"}:
-                await update.message.reply_text("Format: `ban user_id` or `unban user_id`", parse_mode="Markdown", reply_markup=admin_panel_kb()); return
-            action, uid_s = parts
-            uid = int(uid_s)
-            change_ban(uid, action == "ban")
-            await update.message.reply_text(f"✅ {action.upper()} set for {uid}.", reply_markup=admin_panel_kb())
-        else:
-            await update.message.reply_text("Unknown admin mode.", reply_markup=admin_panel_kb())
-    finally:
-        context.user_data["admin_mode"] = None
-
-# ---------------- Admin command shortcuts ----------------
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    await update.message.reply_text("⚙️ Admin Panel", reply_markup=admin_panel_kb())
-
-async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if not context.args:
-        await update.message.reply_text("Usage: /setprice <amount>"); return
-    try:
-        set_setting("credit_cost", int(context.args[0]))
-        await update.message.reply_text(f"✅ Price set to {int(context.args[0])}")
-    except ValueError:
-        await update.message.reply_text("Amount must be an integer.")
-
-async def addcredits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addcredits <user_id> <amount>"); return
-    add_credits(int(context.args[0]), int(context.args[1]))
-    await update.message.reply_text(f"✅ Added {int(context.args[1])} credits to {int(context.args[0])}")
-
-async def removecredits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /removecredits <user_id> <amount>"); return
-    add_credits(int(context.args[0]), -abs(int(context.args[1])))
-    await update.message.reply_text(f"✅ Removed {int(context.args[1])} credits from {int(context.args[0])}")
-
-async def checkcredits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if not context.args:
-        await update.message.reply_text("Usage: /checkcredits <user_id>"); return
-    u = get_user(int(context.args[0]))
-    if not u:
-        await update.message.reply_text("User not found."); return
-    await update.message.reply_text(f"User {u['user_id']} → {u['credits']} credits. {'BANNED' if u['banned'] else 'OK'}")
-
-async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    rows = list_users(limit=50, offset=0)
-    if not rows:
-        await update.message.reply_text("No users."); return
-    lines = ["👥 *Users (first 50)*"]
-    for r in rows:
-        lines.append(f"{r['user_id']} | {r['first_name']} | @{r['username'] or '-'} | {r['credits']} cr | {'BANNED' if r['banned'] else 'OK'}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    s = stats_summary()
-    price = get_setting("credit_cost", DEFAULT_CREDIT_COST)
+async def cmd_help(update, ctx):
+    uid = update.effective_user.id
     await update.message.reply_text(
-        f"📊 Stats\nUsers: {s['users']}\nLookups: {s['lookups']}\nCredits spent: {s['credits_spent']}\nPrice: {price}"
+        "ℹ️ Help\n\n"
+        f"- Each search costs {CREDITS_PER_SEARCH} credits.\n"
+        "- Buy credits via 💳 Buy Credits (send screenshot & UTR).\n"
+        "- Use /redeem CODE to redeem gift codes.\n"
+        "- Admin reviews payments within 10–25 minutes.\n\n"
+        f"UPI: {UPI_ID}\nQR message: {QR_IMAGE_URL}",
+        reply_markup=kb_main(uid)
     )
 
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>"); return
-    msg = " ".join(context.args)
-    total = 0
-    for offset in range(0, count_users(), 100):
-        rows = list_users(limit=100, offset=offset)
-        for r in rows:
-            try:
-                await context.bot.send_message(r["user_id"], f"📢 {msg}")
-                total += 1
-            except Exception:
-                pass
-    await update.message.reply_text(f"✅ Broadcast sent to ~{total} users.")
+async def cmd_add(update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        target = str(ctx.args[0])
+        amount = int(ctx.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /add <user_id> <credits>")
+        return
+    u = get_user(int(target))
+    u["credits"] += amount
+    save_data()
+    await update.message.reply_text(f"✅ Added {amount} credits to {target} (balance: {u['credits']}).")
 
-async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if not context.args:
-        await update.message.reply_text("Usage: /ban <user_id>"); return
-    change_ban(int(context.args[0]), True)
-    await update.message.reply_text(f"🚫 Banned {int(context.args[0])}")
+async def cmd_block(update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        target = str(ctx.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /block <user_id>")
+        return
+    u = get_user(int(target))
+    u["blocked"] = True
+    save_data()
+    await update.message.reply_text(f"🚫 Blocked {target}")
 
-async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        await update.message.reply_text("❌ Unauthorized"); return
-    if not context.args:
-        await update.message.reply_text("Usage: /unban <user_id>"); return
-    change_ban(int(context.args[0]), False)
-    await update.message.reply_text(f"✅ Unbanned {int(context.args[0])}")
+async def cmd_unblock(update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        target = str(ctx.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /unblock <user_id>")
+        return
+    u = get_user(int(target))
+    u["blocked"] = False
+    save_data()
+    await update.message.reply_text(f"✅ Unblocked {target}")
 
-# -------------- MAIN ----------------
+async def cmd_users(update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(f"👥 Users: {len(users)} | Payments: {len(payments)} | Codes: {len(codes)}")
+
+async def cmd_approve(update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        pay_id = ctx.args[0]
+        add_credits = int(ctx.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /approve <payment_id> <credits_to_add>")
+        return
+    match = None
+    for p in payments:
+        if p["id"] == pay_id:
+            match = p
+            break
+    if not match:
+        await update.message.reply_text("❌ Payment ID not found.")
+        return
+    if match.get("status") != "pending":
+        await update.message.reply_text("ℹ️ Payment already processed.")
+        return
+
+    u = get_user(int(match["user_id"]))
+    u["credits"] += add_credits
+    match["status"] = "approved"
+    match["approved_credits"] = add_credits
+    match["approved_ts"] = int(time.time())
+    save_data()
+
+    await update.message.reply_text(f"✅ Approved {pay_id}. Added {add_credits} credits to {match['user_id']} (bal: {u['credits']}).")
+    try:
+        await ctx.bot.send_message(
+            chat_id=match["user_id"],
+            text=f"✅ Your payment `{pay_id}` has been approved.\n💰 Credits added: {add_credits}\n💳 Balance: {u['credits']}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+async def cmd_gen(update, ctx):
+    """Generate redemption codes. Usage: /gen <number_of_users> <credits_per_code>"""
+    if update.effective_user.id != OWNER_ID:
+        return
+    
+    try:
+        num_users = int(ctx.args[0])
+        credits_per_code = int(ctx.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /gen <number_of_users> <credits_per_code>\nExample: /gen 5 100")
+        return
+    
+    if num_users <= 0 or credits_per_code <= 0:
+        await update.message.reply_text("❌ Both numbers must be greater than 0.")
+        return
+    
+    if num_users > 50:
+        await update.message.reply_text("❌ Maximum 50 codes can be generated at once.")
+        return
+    
+    generated_codes = []
+    for _ in range(num_users):
+        code = generate_code()
+        # Ensure code is unique
+        while code in codes:
+            code = generate_code()
+        
+        codes[code] = {
+            "credits": credits_per_code,
+            "created_by": update.effective_user.id,
+            "created_ts": int(time.time()),
+            "redeemed": False,
+            "redeemed_by": None,
+            "redeemed_ts": None
+        }
+        generated_codes.append(code)
+    
+    save_data()
+    
+    codes_text = "\n".join([f"`{code}`" for code in generated_codes])
+    await update.message.reply_text(
+        f"✅ Generated {num_users} codes, each worth {credits_per_code} credits:\n\n{codes_text}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_redeem(update, ctx):
+    """Redeem a code. Usage: /redeem XXX-XXX-XXX"""
+    uid = update.effective_user.id
+    u = get_user(uid)
+    
+    if u["blocked"]:
+        await update.message.reply_text("🚫 You are blocked from using this bot.")
+        return
+    
+    try:
+        code = ctx.args[0].upper().strip()
+    except Exception:
+        await update.message.reply_text("Usage: /redeem XXX-XXX-XXX\nExample: /redeem ABC-123-XYZ")
+        return
+    
+    # Validate code format
+    if not code or len(code) != 11 or code.count('-') != 2:
+        await update.message.reply_text("❌ Invalid code format. Use XXX-XXX-XXX format.")
+        return
+    
+    if code not in codes:
+        await update.message.reply_text("❌ Invalid or expired code.")
+        return
+    
+    code_data = codes[code]
+    if code_data["redeemed"]:
+        await update.message.reply_text("❌ This code has already been redeemed.")
+        return
+    
+    # Redeem the code
+    credits_to_add = code_data["credits"]
+    u["credits"] += credits_to_add
+    
+    code_data["redeemed"] = True
+    code_data["redeemed_by"] = uid
+    code_data["redeemed_ts"] = int(time.time())
+    
+    save_data()
+    
+    await update.message.reply_text(
+        f"✅ Code redeemed successfully!\n💰 Credits added: {credits_to_add}\n💳 New balance: {u['credits']} credits"
+    )
+    
+    # Notify admin
+    try:
+        await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"🎫 Code redeemed:\nCode: `{code}`\nUser: {uid}\nCredits: {credits_to_add}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+# ================== MESSAGE HANDLER ==================
+async def on_message(update, ctx):
+    if update.message is None:
+        return
+    uid = update.effective_user.id
+    msg = update.message
+    text = (msg.text or "").strip()
+
+    u = get_user(uid)
+    if u["blocked"]:
+        await msg.reply_text("🚫 You are blocked.")
+        return
+
+    # Global back
+    if text == "⬅️ Back to Menu":
+        ctx.user_data.clear()
+        await msg.reply_text("🏠 Back to main menu.", reply_markup=kb_main(uid))
+        return
+
+    step = ctx.user_data.get("step")
+
+    # ====== Payment: Amount entry ======
+    if step == "pay_amount":
+        amt_raw = text.lower().replace("rs", "").replace("₹", "").strip()
+        if not amt_raw.replace(".", "", 1).isdigit():
+            await msg.reply_text("❌ Enter amount in numbers only (e.g., 10).", reply_markup=kb_back())
+            return
+        amount = float(amt_raw)
+        if amount <= 0:
+            await msg.reply_text("❌ Amount must be > 0.", reply_markup=kb_back())
+            return
+        ctx.user_data["amount"] = amount
+        ctx.user_data["step"] = "pay_amount_confirm"
+        show_amt = int(amount) if float(amount).is_integer() else amount
+        await msg.reply_text(
+            f"💰 You entered: ₹{show_amt}\nConfirm this amount?",
+            reply_markup=kb_amount_confirm()
+        )
+        return
+
+    # Confirm / change amount
+    if text == "✅ Confirm Amount" and step == "pay_amount_confirm":
+        ctx.user_data["step"] = "pay_ss"
+        await msg.reply_text("📷 Please upload your payment screenshot as a photo.", reply_markup=kb_ss_confirm())
+        return
+    if text == "✏️ Change Amount" and step in ("pay_amount_confirm", "pay_utr_confirm"):
+        ctx.user_data["step"] = "pay_amount"
+        await msg.reply_text("✏️ Enter new amount (in ₹):", reply_markup=kb_back())
+        return
+
+    # Wait for screenshot (if user types instead)
+    if step == "pay_ss":
+        await msg.reply_text("📷 Send the screenshot as a photo. Or tap Back.", reply_markup=kb_ss_confirm())
+        return
+
+    # Confirm screenshot
+    if text == "✅ Confirm Screenshot" and step == "pay_ss_confirm":
+        ctx.user_data["step"] = "pay_utr"
+        await msg.reply_text("🔑 Now enter your UTR / Transaction ID:", reply_markup=kb_utr_confirm())
+        return
+    if text == "📤 Re-upload Screenshot" and step in ("pay_ss", "pay_ss_confirm"):
+        ctx.user_data["step"] = "pay_ss"
+        ctx.user_data.pop("ss_file_id", None)
+        await msg.reply_text("📷 Please upload your payment screenshot again.", reply_markup=kb_ss_confirm())
+        return
+
+    # Enter UTR
+    if step == "pay_utr":
+        if not text or len(text) < 4:
+            await msg.reply_text("❌ Enter a valid UTR / Transaction ID.", reply_markup=kb_utr_confirm())
+            return
+        ctx.user_data["utr"] = text
+        ctx.user_data["step"] = "pay_utr_confirm"
+        await msg.reply_text(f"🔎 You entered UTR: {text}\nConfirm?", reply_markup=kb_utr_confirm())
+        return
+
+    # Confirm UTR -> submit payment
+    if text == "✅ Confirm UTR" and step == "pay_utr_confirm":
+        amount = ctx.user_data.get("amount")
+        utr = ctx.user_data.get("utr")
+        ss_file_id = ctx.user_data.get("ss_file_id")
+
+        pay_id = new_payment_id()
+        record = {
+            "id": pay_id,
+            "user_id": uid,
+            "amount": amount,
+            "utr": utr,
+            "screenshot_file_id": ss_file_id,
+            "status": "pending",
+            "ts": int(time.time())
+        }
+        payments.append(record)
+        save_data()
+
+        try:
+            caption = (
+                f"🧾 Payment Submitted\n"
+                f"ID: {pay_id}\nUser: {uid}\n"
+                f"Amount: ₹{int(amount) if float(amount).is_integer() else amount}\n"
+                f"UTR: {utr}"
+            )
+            if ss_file_id:
+                await ctx.bot.send_photo(OWNER_ID, ss_file_id, caption=caption)
+            else:
+                await ctx.bot.send_message(OWNER_ID, caption)
+            await ctx.bot.send_message(
+                OWNER_ID,
+                "Admin actions:\n"
+                f"/approve {pay_id} <credits_to_add>\n"
+                f"/add {uid} <credits>\n"
+                f"/block {uid}  |  /unblock {uid}"
+            )
+        except Exception:
+            log.exception("Failed to notify admin")
+
+        ctx.user_data.clear()
+        await msg.reply_text(
+            "📥 Payment details submitted!\n"
+            "⏳ Please wait 10–25 minutes — admin will verify and approve.",
+            reply_markup=kb_main(uid)
+        )
+        return
+
+    # ====== Vehicle lookup ======
+    if step == "await_rc":
+        rc = text.upper().replace(" ", "")
+        if not rc:
+            await msg.reply_text("❌ Please enter a valid RC number.", reply_markup=kb_back())
+            return
+
+        if u["credits"] < CREDITS_PER_SEARCH:
+            ctx.user_data.clear()
+            await msg.reply_text(
+                f"❌ Not enough credits. Each search costs {CREDITS_PER_SEARCH} credits.",
+                reply_markup=kb_main(uid)
+            )
+            return
+
+        await msg.reply_text(f"🔎 Searching for vehicle: {rc} ...", reply_markup=kb_back())
+        try:
+            data = fetch_vehicle(rc)
+            # Deduct only on success
+            u["credits"] -= CREDITS_PER_SEARCH
+            u["searches"] += 1
+            save_data()
+            card = render_vehicle_card(rc, data)
+            await msg.reply_text(card, reply_markup=kb_main(uid))
+        except Exception as e:
+            log.exception("API error")
+            await msg.reply_text(f"⚠️ Unable to fetch details right now.\nReason: {e}", reply_markup=kb_main(uid))
+        finally:
+            ctx.user_data.clear()
+        return
+
+    # ================== MAIN BUTTONS ==================
+    if text == "🔍 Vehicle Lookup":
+        if u["credits"] < CREDITS_PER_SEARCH:
+            await msg.reply_text(
+                f"⚠️ Not enough credits!\n\n{BUY_PRICE_TEXT}\n\nGo to 💳 Buy Credits.",
+                reply_markup=kb_main(uid)
+            )
+            return
+        ctx.user_data.clear()
+        ctx.user_data["step"] = "await_rc"
+        await msg.reply_text("📮 Send RC number (e.g., BR29AB7794):", reply_markup=kb_back())
+        return
+
+    if text == "💳 Buy Credits":
+        ctx.user_data.clear()
+        await msg.reply_text(
+            f"💳 Buy Credits\n\n{BUY_PRICE_TEXT}\n\n"
+            f"📌 UPI ID: {UPI_ID}\n"
+            f"🖼️ QR Code post: {QR_IMAGE_URL}\n\n"
+            "After paying, tap '✅ Payment Done'.",
+            reply_markup=kb_buy_main()
+        )
+        return
+
+    if text == "✅ Payment Done":
+        ctx.user_data.clear()
+        ctx.user_data["step"] = "pay_amount"
+        await msg.reply_text("🔢 Enter the amount you paid (numbers only, e.g., 10):", reply_markup=kb_back())
+        return
+
+    if text == "📊 My Balance":
+        await msg.reply_text(f"💰 Credits: {u['credits']}", reply_markup=kb_main(uid))
+        return
+
+    if text == "👤 Profile":
+        await msg.reply_text(
+            "👤 Your Profile\n"
+            f"• User ID: {uid}\n"
+            f"• Credits: {u['credits']}\n"
+            f"• Total Searches: {u.get('searches', 0)}",
+            reply_markup=kb_main(uid)
+        )
+        return
+
+    if text == "ℹ️ Help":
+        await cmd_help(update, ctx)
+        return
+
+    if text == "⚙️ Admin Panel" and uid == OWNER_ID:
+        await msg.reply_text(
+            "⚙️ Admin Panel\n\n"
+            "Commands:\n"
+            "• /approve <payment_id> <credits>\n"
+            "• /add <user_id> <credits>\n"
+            "• /block <user_id>\n"
+            "• /unblock <user_id>\n"
+            "• /gen <users> <credits>\n"
+            "• /users",
+            reply_markup=kb_admin()
+        )
+        return
+
+    if text == "📬 Pending Payments" and uid == OWNER_ID:
+        pend = [p for p in payments if p.get("status") == "pending"]
+        if not pend:
+            await msg.reply_text("✅ No pending payments.", reply_markup=kb_admin())
+        else:
+            pend_sorted = sorted(pend, key=lambda x: x["ts"], reverse=True)[:12]
+            lines = []
+            for p in pend_sorted:
+                amt = p.get("amount")
+                show_amt = int(amt) if float(amt).is_integer() else amt
+                lines.append(f"ID: {p['id']} | User: {p['user_id']} | ₹{show_amt} | UTR: {p.get('utr','N/A')}")
+            await msg.reply_text("📬 Pending Payments\n" + "\n".join(lines), reply_markup=kb_admin())
+        return
+
+    if text == "📈 Stats" and uid == OWNER_ID:
+        total_users = len(users)
+        total_credits = sum(u2.get("credits", 0) for u2 in users.values())
+        total_searches = sum(u2.get("searches", 0) for u2 in users.values())
+        pend_count = sum(1 for p in payments if p.get("status") == "pending")
+        redeemed_codes = sum(1 for c in codes.values() if c.get("redeemed"))
+        active_codes = len(codes) - redeemed_codes
+        
+        await msg.reply_text(
+            "📈 Bot Stats\n"
+            f"• Users: {total_users}\n"
+            f"• Total Credits: {total_credits}\n"
+            f"• Total Searches: {total_searches}\n"
+            f"• Pending Payments: {pend_count}\n"
+            f"• Active Codes: {active_codes}\n"
+            f"• Redeemed Codes: {redeemed_codes}",
+            reply_markup=kb_admin()
+        )
+        return
+
+    if text == "🎫 Generate Codes" and uid == OWNER_ID:
+        await msg.reply_text(
+            "🎫 Generate Codes\n\n"
+            "Use command: /gen <users> <credits>\n"
+            "Example: /gen 5 100\n\n"
+            "This will create 5 codes, each worth 100 credits.",
+            reply_markup=kb_admin()
+        )
+        return
+
+    if text == "📋 View Codes" and uid == OWNER_ID:
+        if not codes:
+            await msg.reply_text("📋 No codes found.", reply_markup=kb_admin())
+            return
+        
+        active_codes = []
+        redeemed_codes = []
+        
+        for code, data in codes.items():
+            if data.get("redeemed"):
+                redeemed_codes.append(f"`{code}` - {data['credits']} credits (Redeemed by {data['redeemed_by']})")
+            else:
+                active_codes.append(f"`{code}` - {data['credits']} credits")
+        
+        response = "📋 Codes Status\n\n"
+        
+        if active_codes:
+            response += "🟢 Active Codes:\n" + "\n".join(active_codes[:10])
+            if len(active_codes) > 10:
+                response += f"\n... and {len(active_codes) - 10} more"
+        
+        if redeemed_codes:
+            response += "\n\n🔴 Recently Redeemed:\n" + "\n".join(redeemed_codes[:5])
+            if len(redeemed_codes) > 5:
+                response += f"\n... and {len(redeemed_codes) - 5} more"
+        
+        await msg.reply_text(response, reply_markup=kb_admin(), parse_mode="Markdown")
+        return
+
+    # Fallback
+    await msg.reply_text("❌ Invalid input. Please use the menu buttons.", reply_markup=kb_main(uid))
+
+# ================== PHOTO HANDLER ==================
+async def on_photo(update, ctx):
+    if update.message is None or not update.message.photo:
+        return
+    step = ctx.user_data.get("step")
+    if step not in ("pay_ss", "pay_ss_confirm"):
+        return
+    photo = update.message.photo[-1]
+    ctx.user_data["ss_file_id"] = photo.file_id
+    ctx.user_data["step"] = "pay_ss_confirm"
+    await update.message.reply_text(
+        "✅ Screenshot received.\nConfirm or re-upload?",
+        reply_markup=kb_ss_confirm()
+    )
+
+# ================== MAIN ==================
 def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # User commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("credits", credits_cmd))
-    app.add_handler(CommandHandler("vehicle", vehicle_cmd))
-
-    # Admin commands
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("setprice", setprice_cmd))
-    app.add_handler(CommandHandler("addcredits", addcredits_cmd))
-    app.add_handler(CommandHandler("removecredits", removecredits_cmd))
-    app.add_handler(CommandHandler("checkcredits", checkcredits_cmd))
-    app.add_handler(CommandHandler("users", users_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("ban", ban_cmd))
-    app.add_handler(CommandHandler("unban", unban_cmd))
-
-    # Buttons & admin guided modes
-    app.add_handler(CallbackQueryHandler(button_router))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), admin_free_text))
-
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    print("🤖 Bot starting...")
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Commands
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("add", cmd_add))
+        app.add_handler(CommandHandler("block", cmd_block))
+        app.add_handler(CommandHandler("unblock", cmd_unblock))
+        app.add_handler(CommandHandler("users", cmd_users))
+        app.add_handler(CommandHandler("approve", cmd_approve))
+        app.add_handler(CommandHandler("gen", cmd_gen))
+        app.add_handler(CommandHandler("redeem", cmd_redeem))
+        
+        # Message handlers using proper filters
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+        app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+        
+        print(f"🚀 Bot started! Users: {len(users)} | Payments: {len(payments)} | Codes: {len(codes)}")
+        app.run_polling()
+    except Exception as e:
+        log.exception("Bot startup failed")
+        print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     main()
