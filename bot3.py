@@ -30,16 +30,16 @@ except ImportError as e:
     exit(1)
 
 # ================== CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8400752699:AAH_dgoJARayhGGOy0jGEEd_YURkzehy0q0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8215193114:AAHUh5IiDEqIv37FjxSzRh_bLZx5J8JddYY")
 OWNER_ID = 8120431402
 DATA_FILE = "users.json"
 
-API_ENDPOINT = "https://rtdb-2.onrender.com/vehicle?rc="
+API_ENDPOINT = "https://pvt-api-3-ry0a.onrender.com/vehicle?rc="
 
 # Payments & Credits
 CREDITS_PER_SEARCH = 10       # 1 search costs 10 credits
-UPI_ID = "http://t.me/OSINTSUPPORTsBOT"
-QR_IMAGE_URL = "https://t.me/Vechialosint"   # not a direct image; we show as text link
+UPI_ID = "http://t.me/userbahi"
+QR_IMAGE_URL = "https://t.me/bot_update_group"   # not a direct image; we show as text link
 BUY_PRICE_TEXT = f"💳 Price: 10₹ = 10 credits\n({CREDITS_PER_SEARCH} credits = 1 search)"
 
 # ================== LOGGING ==================
