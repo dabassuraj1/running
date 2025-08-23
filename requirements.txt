@@ -1,4 +1,6 @@
-python-telegram-bot==20.7
-requests==2.31.0
-beautifulsoup4==4.12.3
-lxml==4.9.3
+pyrofork
+requests
+beautifulsoup4
+trio
+pymongo
+tgcrypto-pyrofork
