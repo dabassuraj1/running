@@ -1,6 +1,5 @@
-pyrofork
-requests
-beautifulsoup4
-trio
+pyrogram==1.4.16
+tgcrypto
 pymongo
-tgcrypto-pyrofork
+beautifulsoup4
+requests
